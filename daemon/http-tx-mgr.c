@@ -280,9 +280,12 @@ recv_response (void *contents, size_t size, size_t nmemb, void *userp)
     return realsize;
 }
 
+typedef size_t (*HttpRecvCallback) (void *, size_t, size_t, void *);
+
 static int
 http_get (CURL *curl, const char *url, const char *token,
-          int *rsp_status, char **rsp_content, gint64 *rsp_size)
+          int *rsp_status, char **rsp_content, gint64 *rsp_size,
+          HttpRecvCallback callback, void *cb_data)
 {
     char *token_header;
     struct curl_slist *headers = NULL;
@@ -303,6 +306,9 @@ http_get (CURL *curl, const char *url, const char *token,
     if (rsp_content) {
         curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, recv_response);
         curl_easy_setopt(curl, CURLOPT_WRITEDATA, &rsp);
+    } else if (callback) {
+        curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, callback);
+        curl_easy_setopt(curl, CURLOPT_WRITEDATA, cb_data);
     }
 
     int rc = curl_easy_perform (curl);
@@ -506,6 +512,8 @@ handle_http_errors (HttpTxTask *task, int status)
     else if (status == HTTP_FORBIDDEN)
         task->error = HTTP_TASK_ERR_FORBIDDEN;
     else if (status >= HTTP_INTERNAL_SERVER_ERROR)
+        task->error = HTTP_TASK_ERR_SERVER;
+    else if (status == HTTP_NOT_FOUND)
         task->error = HTTP_TASK_ERR_SERVER;
     else
         task->error = HTTP_TASK_ERR_UNKNOWN;
@@ -759,7 +767,7 @@ check_protocol_version (HttpTxTask *task, Connection *conn)
 
     url = g_strdup_printf ("%s/seaf-sync/protocol-version", task->host);
 
-    if (http_get (curl, url, NULL, &status, &rsp_content, &rsp_size) < 0) {
+    if (http_get (curl, url, NULL, &status, &rsp_content, &rsp_size, NULL, NULL) < 0) {
         task->error = HTTP_TASK_ERR_NET;
         ret = -1;
         goto out;
@@ -796,7 +804,7 @@ check_permission (HttpTxTask *task, Connection *conn)
     url = g_strdup_printf ("%s/seaf-sync/repo/%s/permission-check/?op=%s",
                            task->host, task->repo_id, type);
 
-    if (http_get (curl, url, task->token, &status, NULL, NULL) < 0) {
+    if (http_get (curl, url, task->token, &status, NULL, NULL, NULL, NULL) < 0) {
         task->error = HTTP_TASK_ERR_NET;
         ret = -1;
         goto out;
@@ -990,7 +998,7 @@ check_quota (HttpTxTask *task, Connection *conn)
     url = g_strdup_printf ("%s/seaf-sync/repo/%s/quota-check/?delta=%"G_GINT64_FORMAT"",
                            task->host, task->repo_id, delta);
 
-    if (http_get (curl, url, task->token, &status, NULL, NULL) < 0) {
+    if (http_get (curl, url, task->token, &status, NULL, NULL, NULL, NULL) < 0) {
         task->error = HTTP_TASK_ERR_NET;
         ret = -1;
         goto out;
@@ -1198,7 +1206,7 @@ upload_check_id_list_segment (HttpTxTask *task, Connection *conn, const char *ur
     json_error_t jerror;
     char *obj_id;
     int n_sent = 0;
-    char *data;
+    char *data = NULL;
     int len;
     CURL *curl;
     int status;
@@ -1273,6 +1281,7 @@ upload_check_id_list_segment (HttpTxTask *task, Connection *conn, const char *ur
 
 out:
     curl_easy_reset (curl);
+    g_free (data);
     g_free (rsp_content);
 
     return ret;
@@ -1355,6 +1364,7 @@ send_fs_objects (HttpTxTask *task, Connection *conn, GList **send_fs_list)
 out:
     g_free (url);
     evbuffer_free (buf);
+    curl_easy_reset (curl);
 
     return ret;
 }
@@ -1849,4 +1859,437 @@ http_upload_done (void *vdata)
         transition_state (task, task->state, HTTP_TASK_RT_STATE_FINISHED);
     else
         transition_state (task, HTTP_TASK_STATE_FINISHED, HTTP_TASK_RT_STATE_FINISHED);
+}
+
+/* Download */
+
+static void *http_download_thread (void *vdata);
+static void http_download_done (void *vdata);
+
+int
+http_tx_manager_add_download (HttpTxManager *manager,
+                              const char *repo_id,
+                              int repo_version,
+                              const char *host,
+                              const char *token,
+                              const char *server_head_id,
+                              gboolean is_clone,
+                              const char *passwd,
+                              const char *worktree,
+                              GError **error)
+{
+    HttpTxTask *task;
+    SeafRepo *repo;
+
+    if (!repo_id || !token || !host || !server_head_id) {
+        g_set_error (error, SEAFILE_DOMAIN, SEAF_ERR_BAD_ARGS, "Empty argument(s)");
+        return -1;
+    }
+
+    repo = seaf_repo_manager_get_repo (seaf->repo_mgr, repo_id);
+    if (!repo) {
+        g_set_error (error, SEAFILE_DOMAIN, SEAF_ERR_BAD_ARGS, "Repo not found");
+        return -1;
+    }
+
+    clean_tasks_for_repo (manager, repo_id);
+
+    task = http_tx_task_new (manager, repo_id, repo_version,
+                             HTTP_TASK_TYPE_DOWNLOAD, is_clone,
+                             host, token, passwd, worktree);
+
+    memcpy (task->head, server_head_id, 40);
+
+    task->state = TASK_STATE_NORMAL;
+
+    g_hash_table_insert (manager->priv->download_tasks,
+                         g_strdup(repo_id),
+                         task);
+
+    ccnet_job_manager_schedule_job (seaf->job_mgr,
+                                    http_download_thread,
+                                    http_download_done,
+                                    task);
+
+    return 0;
+}
+
+static int
+get_commit_object (HttpTxTask *task, Connection *conn)
+{
+    CURL *curl;
+    char *url;
+    int status;
+    char *rsp_content = NULL;
+    gint64 rsp_size;
+    int ret = 0;
+
+    curl = conn->curl;
+
+    url = g_strdup_printf ("%s/seaf-sync/repo/%s/commit/%s",
+                           task->host, task->repo_id, task->head);
+
+    if (http_get (curl, url, task->token, &status,
+                  &rsp_content, &rsp_size,
+                  NULL, NULL) < 0) {
+        task->error = HTTP_TASK_ERR_NET;
+        ret = -1;
+        goto out;
+    }
+
+    if (status != HTTP_OK) {
+        seaf_warning ("Bad response code for GET %s: %d.\n", url, status);
+        handle_http_errors (task, status);
+        ret = -1;
+        goto out;
+    }
+
+    int rc = seaf_obj_store_write_obj (seaf->commit_mgr->obj_store,
+                                       task->repo_id, task->repo_version,
+                                       task->head,
+                                       rsp_content,
+                                       rsp_size,
+                                       FALSE);
+    if (rc < 0) {
+        seaf_warning ("Failed to save commit %s in repo %.8s.\n",
+                      task->head, task->repo_id);
+        task->error = HTTP_TASK_ERR_WRITE_LOCAL_DATA;
+        ret = -1;
+    }
+
+out:
+    g_free (url);
+    g_free (rsp_content);
+    curl_easy_reset (curl);
+
+    return ret;
+}
+
+static GList *
+get_needed_fs_id_list (HttpTxTask *task, Connection *conn)
+{
+    SeafBranch *master;
+    CURL *curl;
+    char *url = NULL;
+    int status;
+    char *rsp_content = NULL;
+    gint64 rsp_size;
+    GList *ret = NULL;
+    json_t *array;
+    json_error_t jerror;
+    const char *obj_id;
+
+    if (!task->is_clone) {
+        master = seaf_branch_manager_get_branch (seaf->branch_mgr,
+                                                 task->repo_id,
+                                                 "master");
+        if (!master) {
+            seaf_warning ("Failed to get branch master for repo %.8s.\n",
+                          task->repo_id);
+            return NULL;
+        }
+
+        url = g_strdup_printf ("%s/seaf-sync/repo/%s/fs-id-list/"
+                               "?server-head=%s&client-head=%s",
+                               task->host, task->repo_id,
+                               task->head, master->commit_id);
+
+        seaf_branch_unref (master);
+    } else {
+        url = g_strdup_printf ("%s/seaf-sync/repo/%s/fs-id-list/?server-head=%s",
+                               task->host, task->repo_id, task->head);
+    }
+
+    curl = conn->curl;
+
+    if (http_get (curl, url, task->token, &status,
+                  &rsp_content, &rsp_size,
+                  NULL, NULL) < 0) {
+        task->error = HTTP_TASK_ERR_NET;
+        ret = -1;
+        goto out;
+    }
+
+    if (status != HTTP_OK) {
+        seaf_warning ("Bad response code for GET %s: %d.\n", url, status);
+        handle_http_errors (task, status);
+        ret = -1;
+        goto out;
+    }
+
+    array = json_loadb (rsp_content, rsp_size, 0, &jerror);
+    if (!array) {
+        seaf_warning ("Invalid JSON response from the server: %s.\n", jerror.text);
+        task->error = HTTP_TASK_ERR_SERVER;
+        ret = -1;
+        goto out;
+    }
+
+    int i;
+    size_t n = json_array_size (array);
+    json_t *str;
+    for (i = 0; i < n; ++i) {
+        str = json_array_get (array, i);
+        if (!str) {
+            seaf_warning ("Invalid JSON response from the server.\n");
+            json_decref (array);
+            ret = -1;
+            goto out;
+        }
+
+        obj_id = json_string_value(str);
+
+        if (!seaf_obj_store_obj_exists (seaf->fs_mgr->obj_store,
+                                        task->repo_id, task->repo_version,
+                                        obj_id)) {
+            ret = g_list_prepend (ret, g_strdup(obj_id));
+        } else if (task->is_clone) {
+            gboolean io_error = FALSE;
+            gboolean sound;
+            sound = seaf_fs_manager_verify_object (seaf->fs_mgr,
+                                                   task->repo_id, task->repo_version,
+                                                   obj_id, FALSE, &io_error);
+            if (!sound && !io_error)
+                ret = g_list_prepend (ret, g_strdup(obj_id));
+        }
+    }
+
+    json_decref (array);
+
+out:
+    g_free (url);
+    g_free (rsp_content);
+    curl_easy_reset (curl);
+
+    return ret;
+}
+
+#define GET_FS_OBJECT_N 100
+
+static int
+get_fs_objects (HttpTxTask *task, Connection *conn, GList **fs_list)
+{
+    json_t *array;
+    json_error_t jerror;
+    char *obj_id;
+    int n_sent = 0;
+    char *data = NULL;
+    int len;
+    CURL *curl;
+    int status;
+    char *rsp_content = NULL;
+    gint64 rsp_size;
+    int ret = 0;
+
+    /* Convert object id list to JSON format. */
+
+    array = json_array ();
+
+    while (*fs_list != NULL) {
+        obj_id = (*fs_list)->data;
+        json_array_append_new (array, json_string(obj_id));
+
+        *fs_list = g_list_delete_link (*fs_list, *fs_list);
+        g_free (obj_id);
+
+        if (++n_sent >= GET_FS_OBJECT_N)
+            break;
+    }
+
+    data = json_dumps (array, 0);
+    len = strlen(data);
+    json_decref (array);
+
+    /* Send fs object id list. */
+
+    curl = conn->curl;
+
+    url = g_strdup_printf ("%s/seaf-sync/repo/%s/pack-fs/", task->host, task->repo_id);
+
+    if (http_post (curl, url, task->token,
+                   data, len,
+                   &status, &rsp_content, &rsp_size) < 0) {
+        task->error = HTTP_TASK_ERR_NET;
+        ret = -1;
+        goto out;
+    }
+
+    if (status != HTTP_OK) {
+        seaf_warning ("Bad response code for POST %s: %d.\n", url, status);
+        handle_http_errors (task, status);
+        ret = -1;
+        goto out;
+    }
+
+    /* Save received fs objects. */
+
+    char *p = rsp_content;
+    ObjectHeader *hdr = (ObjectHeader *)p;
+    int n = 0;
+    int size;
+    int rc;
+    while (n < rsp_size) {
+        size = ntohl (hdr->obj_size);
+        if (n + sizeof(ObjectHeader) + size > rsp_size) {
+            seaf_warning ("Incomplete object package received for repo %.8s.\n",
+                          task->repo_id);
+            task->error = HTTP_TASK_ERR_SERVER;
+            ret = -1;
+            goto out;
+        }
+
+        rc = seaf_obj_store_write_obj (seaf->fs_mgr->obj_store,
+                                       task->repo_id, task->repo_version,
+                                       hdr->obj_id,
+                                       hdr->object,
+                                       size, FALSE);
+        if (rc < 0) {
+            seaf_warning ("Failed to write fs object %s in repo %.8s.\n",
+                          hdr->obj_id, task->repo_id);
+            task->error = HTTP_TASK_ERR_WRITE_LOCAL_DATA;
+            ret = -1;
+            goto out;
+        }
+
+        p += (sizeof(ObjectHeader) + size);
+        n += (sizeof(ObjectHeader) + size);
+        hdr = (ObjectHeader *)p;
+    }
+
+out:
+    g_free (url);
+    g_free (data);
+    g_free (rsp_content);
+    curl_easy_reset (curl);
+
+    return ret;
+}
+
+typedef struct {
+    char block_id[41];
+    BlockHandle *block;
+    HttpTxTask *task;
+} GetBlockData;
+
+static size_t
+get_block_callback (void *ptr, size_t size, size_t nmemb, void *userp)
+{
+    size_t realsize = size *nmemb;
+    SendBlockData *data = userp;
+    HttpTxTask *task = data->task;
+    size_t n;
+
+    if (task->state == HTTP_TASK_STATE_CANCELED)
+        return 0;
+
+    n = seaf_block_manager_write_block (seaf->block_mgr,
+                                        data->block,
+                                        ptr, realsize);
+    if (n < realsize) {
+        seaf_warning ("Failed to write block %s in repo %.8s.\n",
+                      data->block_id, task->repo_id);
+        task->error = HTTP_TASK_ERR_BAD_LOCAL_DATA;
+        return n;
+    }
+
+    /* Update global transferred bytes. */
+    g_atomic_int_add (&(seaf->http_tx_mgr->recv_bytes), n);
+
+    /* If uploaded bytes exceeds the limit, wait until the counter
+     * is reset. We check the counter every 100 milliseconds, so we
+     * can waste up to 100 milliseconds without sending data after
+     * the counter is reset.
+     */
+    while (1) {
+        gint sent = g_atomic_int_get(&(seaf->http_tx_mgr->recv_bytes));
+        if (seaf->http_tx_mgr->download_limit > 0 &&
+            sent > seaf->http_tx_mgr->download_limit)
+            /* 100 milliseconds */
+            g_usleep (100000);
+        else
+            break;
+    }
+
+    return n;
+}
+
+static int
+get_block (HttpTxTask *task, Connection *conn, const char *block_id)
+{
+    CURL *curl;
+    char *url;
+    int status;
+    BlockHandle *block;
+    int ret = 0;
+
+    block = seaf_block_manager_open_block (seaf->block_mgr,
+                                           task->repo_id, task->repo_version,
+                                           block_id, BLOCK_WRITE);
+    if (!block) {
+        seaf_warning ("Failed to open block %s in repo %.8s.\n",
+                      block_id, task->repo_id);
+        return -1;
+    }
+
+    GetBlockData data;
+    memcpy (data.block_id, block_id, 40);
+    data.block = block;
+    data.task = task;
+
+    curl = conn->curl;
+
+    url = g_strdup_printf ("%s/seaf-sync/repo/%s/block/%s",
+                           task->host, task->repo_id, block_id);
+
+    if (http_get (curl, url, task->token, &status, NULL, NULL,
+                  get_block_callback, &data) < 0) {
+        if (task->state == HTTP_TASK_STATE_CANCELED)
+            goto error;
+
+        if (task->error == HTTP_OK)
+            task->error = HTTP_TASK_ERR_NET;
+        ret = -1;
+        goto error;
+    }
+
+    if (status != HTTP_OK) {
+        seaf_warning ("Bad response code for GET %s: %d.\n", url, status);
+        handle_http_errors (task, status);
+        ret = -1;
+        goto error;
+    }
+
+    seaf_block_manager_close_block (seaf->block_mgr, block);
+
+    if (seaf_block_manager_commit_block (seaf->block_mgr, block) < 0) {
+        seaf_warning ("Failed to commit block %s in repo %.8s.\n",
+                      block_id, task->repo_id);
+        task->error = HTTP_TASK_ERR_WRITE_LOCAL_DATA;
+        ret = -1;
+    }
+
+    seaf_block_manager_block_handle_free (seaf->block_mgr, block);
+
+    return ret;
+
+error:
+    g_free (url);
+    curl_easy_reset (curl);
+
+    seaf_block_manager_close_block (seaf->block_mgr, block);
+    seaf_block_manager_block_handle_free (seaf->block_mgr, block);
+
+    return ret;
+}
+
+static void *
+http_download_thread (void *vdata)
+{
+
+}
+
+static void
+http_download_done (void *vdata)
+{
+
 }
